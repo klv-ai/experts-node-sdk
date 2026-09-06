@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the floor (native fetch + WebSocket); 24 catches what is coming.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # The unit suite stubs the transport, so it cannot see the SDK drifting from
+  # the services it wraps. This can. It needs a live install, so it only runs
+  # where the secret exists — never on a fork's pull request.
+  live:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Integration tests
+        env:
+          EXPERTS_BASE_URL: ${{ secrets.EXPERTS_BASE_URL }}
+          EXPERTS_TEST_KEY: ${{ secrets.EXPERTS_TEST_KEY }}
+        run: |
+          if [ -z "$EXPERTS_TEST_KEY" ]; then
+            echo "::notice::No EXPERTS_TEST_KEY configured; skipping live tests."
+            exit 0
+          fi
+          npm run test:live

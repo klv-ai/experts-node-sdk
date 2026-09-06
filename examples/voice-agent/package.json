@@ -1,0 +1,7 @@
+{
+  "name": "experts-voice-agent-example",
+  "private": true,
+  "type": "module",
+  "description": "Drive a voice pipeline through the OpenAI-compatible endpoint.",
+  "dependencies": { "openai": "^4.77.0" }
+}

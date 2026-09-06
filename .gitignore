@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# An example pins its own deps loosely; the lockfile is noise in review.
+examples/*/package-lock.json

@@ -1,0 +1,48 @@
+{
+  "name": "@klv-ai/experts",
+  "version": "0.1.0",
+  "description": "Official Node/TypeScript SDK for the Klavi Experts API — conversations, streaming, experts, and knowledge.",
+  "license": "MIT",
+  "author": "Klavi AI",
+  "homepage": "https://github.com/klv-ai/experts-node-sdk#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/klv-ai/experts-node-sdk.git" },
+  "bugs": { "url": "https://github.com/klv-ai/experts-node-sdk/issues" },
+  "keywords": ["klavi", "experts", "ai", "llm", "rag", "chatbot", "sdk"],
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js",
+      "require": "./dist/browser.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "lint": "eslint src test",
+    "prepublishOnly": "npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "eslint": "^9.17.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0",
+    "vitest": "^2.1.8"
+  }
+}
