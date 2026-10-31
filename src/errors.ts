@@ -3,8 +3,8 @@
  *
  * The distinctions here are the ones a caller has to act on differently, not
  * a taxonomy for its own sake. In particular `ExpertsLicenseError` is not a
- * variety of "forbidden": it says the *installation's* licence has lapsed, so
- * no amount of fixing the request will help and the person who can fix it is
+ * variety of "forbidden": it says the *installation's* licence is not valid,
+ * so no amount of fixing the request will help and the person who can fix it is
  * the install's administrator, not the developer reading the stack trace.
  */
 
@@ -43,14 +43,55 @@ export class ExpertsAuthError extends ExpertsError {}
 export class ExpertsPermissionError extends ExpertsError {}
 
 /**
- * 403 with `{"error": "license_expired"}` — the INSTALL's licence has lapsed.
+ * 403 `expert_not_available` — this credential may not use that expert.
+ *
+ * Raised by a chat turn naming an expert above the caller's role, private to
+ * someone else, or limited to org profiles the caller is not in. Before build
+ * pack 1.1 the turn answered on the site default model instead, with no
+ * persona and no knowledge; now it is refused, and the SDK settles the
+ * placeholder message so the conversation does not show it typing forever.
+ */
+export class ExpertNotAvailableError extends ExpertsPermissionError {}
+
+/**
+ * 403 with `{"error": "license_expired"}` — the INSTALL's licence is not valid.
  *
  * Separate from ExpertsPermissionError on purpose. Nothing about the request
  * is wrong and no retry or credential change will help; the install's
- * administrator has to renew. Telling a developer "forbidden" here sends them
+ * administrator has to act. Telling a developer "forbidden" here sends them
  * to debug their own code for an hour.
+ *
+ * Expiry is the usual cause but not the only one: an install with no key, a
+ * server clock set backwards, or one that has not reached Klavi for longer
+ * than its licence allows all answer the same way. `message` carries the
+ * install's own reason.
  */
-export class ExpertsLicenseError extends ExpertsError {}
+export class ExpertsLicenseError extends ExpertsError {
+  /** True when the install still serves reads. See ExpertsLicenseReadOnlyError. */
+  get readOnly(): boolean {
+    return false;
+  }
+}
+
+/**
+ * 403 with `{"error": "license_expired_readonly"}` — a write, refused because
+ * the licence lapsed recently.
+ *
+ * For a window after its licence expires (30 days), an install stays
+ * read-only rather than going dark: GETs are served, so conversations,
+ * experts and knowledge can still be listed, read and exported. Everything
+ * else is refused with this, including the calls that read but go out as a
+ * POST — sending a message and `knowledge.search()` among them.
+ *
+ * Extends ExpertsLicenseError, so code that already catches that keeps
+ * working. Past the window the install answers ExpertsLicenseError for reads
+ * too.
+ */
+export class ExpertsLicenseReadOnlyError extends ExpertsLicenseError {
+  override get readOnly(): boolean {
+    return true;
+  }
+}
 
 /**
  * 404 — or a resource this credential may not see.
@@ -123,6 +164,16 @@ function messageFrom(body: unknown, status: number): { message: string; code?: s
     // FastAPI's default: {"detail": ...}
     const detail = record["detail"];
     if (typeof detail === "string") return { message: detail };
+    // A structured refusal: {"detail": {"reason": "...", "message": "..."}}
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      const d = detail as Record<string, unknown>;
+      const reason = d["reason"] ?? d["error"];
+      const text = d["message"] ?? d["detail"] ?? reason;
+      return {
+        message: text ? String(text) : `Request failed with status ${status}`,
+        code: typeof reason === "string" ? reason : undefined,
+      };
+    }
     if (Array.isArray(detail)) return { message: JSON.stringify(detail).slice(0, 500) };
   }
   return { message: `Request failed with status ${status}` };
@@ -133,12 +184,27 @@ export function errorFromResponse({ status, body, requestId, retryAfter }: Error
   const { message, code } = messageFrom(body, status);
   const options = { status, code, body, requestId };
 
-  if (status === 401) return new ExpertsAuthError(message, options);
+  if (status === 401) {
+    // The knowledge service answers "you may not see this document" with 401,
+    // not 403. The credential is fine; the permission is not.
+    if (/insufficient permissions/i.test(message)) {
+      return new ExpertsPermissionError(message, options);
+    }
+    return new ExpertsAuthError(message, options);
+  }
   if (status === 403) {
+    if (code === "expert_not_available") return new ExpertNotAvailableError(message, options);
     // An install-level failure wearing a request-level status code.
+    if (code === "license_expired_readonly") {
+      return new ExpertsLicenseReadOnlyError(
+        `${message} (the installation's licence has expired and it is read-only ` +
+          `until renewed — reads still work, this write cannot)`,
+        options,
+      );
+    }
     if (code === "license_expired") {
       return new ExpertsLicenseError(
-        `${message} (the installation's licence has expired — this is not something ` +
+        `${message} (the installation's licence is not valid — this is not something ` +
           `your request or credentials can fix)`,
         options,
       );

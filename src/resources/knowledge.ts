@@ -6,13 +6,24 @@
  * `{timestamp, status, message, count, data}` and the rows inside are
  * snake_case. Unwrapped here so callers see the same shape as everywhere else.
  *
- * Uploading is asynchronous. A document is accepted, then split, embedded and
- * indexed by a worker — so a file that has just uploaded is NOT yet
- * retrievable. `waitForProcessing()` is the honest way to sequence an ingest.
+ * Uploading is asynchronous. A file is accepted into an indexing JOB, then
+ * split, embedded and indexed by a worker — so a file that has just uploaded
+ * is NOT yet retrievable, and the upload's answer is the job, not a document.
+ * The job's status is where the document's uid appears, and where a file that
+ * could not be read says why. `waitForProcessing()` is the honest way to
+ * sequence an ingest.
  */
 
 import type { Transport } from "../http.js";
-import type { Collection, KnowledgeDocument, UUID } from "../types.js";
+import type {
+  Collection,
+  KnowledgeDocument,
+  SearchHit,
+  UploadedFile,
+  UploadJob,
+  UploadStatus,
+  UUID,
+} from "../types.js";
 
 interface Envelope<T> {
   timestamp?: number;
@@ -29,18 +40,44 @@ interface RawCollection {
   file_count?: number;
   created_at?: number | string | null;
   updated_at?: number | string | null;
+  min_role_id?: number;
+  is_public?: boolean;
+  scope_uids?: string[] | null;
 }
 
 interface RawDocument {
   uid: string;
-  name?: string;
-  type?: string | null;
-  description?: string | null;
-  collection_uid?: string | null;
+  doc_name?: string;
+  doc_type?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  file_size?: number | null;
   created_at?: number | string | null;
-  // Set once the worker has embedded it.
-  processed?: boolean;
-  embedded?: boolean;
+}
+
+interface RawHit {
+  cosine_dist?: number;
+  split_text?: string;
+  text_split_uid?: string;
+  source_doc_uid?: string;
+  doc_name?: string;
+  title?: string | null;
+  summary?: string | null;
+  page_number?: number | null;
+  source_location?: string | null;
+  start_ms?: number | null;
+  end_ms?: number | null;
+  rerank_score?: number | null;
+}
+
+interface RawJobStatus {
+  total_files?: number;
+  queue?: {
+    status_id?: number;
+    object_uid?: string | null;
+    object_name?: string;
+    extra?: string | null;
+  }[];
 }
 
 function isoOrNull(value: number | string | null | undefined): string | null {
@@ -58,17 +95,80 @@ function toCollection(raw: RawCollection): Collection {
     fileCount: raw.file_count ?? 0,
     createdAt: isoOrNull(raw.created_at),
     updatedAt: isoOrNull(raw.updated_at),
+    minRoleId: raw.min_role_id ?? 2,
+    isPublic: raw.is_public ?? false,
+    scopeUids: raw.scope_uids ?? [],
   };
 }
 
-function toDocument(raw: RawDocument): KnowledgeDocument {
+function toDocument(raw: RawDocument, collection: UUID | undefined): KnowledgeDocument {
   return {
     uid: raw.uid,
-    name: raw.name ?? "",
-    type: raw.type ?? null,
-    description: raw.description ?? null,
-    collectionUid: raw.collection_uid ?? null,
+    name: raw.doc_name ?? "",
+    type: raw.doc_type ?? null,
+    description: raw.summary ?? null,
+    // The row names no collection; keep the one it was listed from.
+    collectionUid: collection ?? null,
     createdAt: isoOrNull(raw.created_at),
+    title: raw.title ?? null,
+    summary: raw.summary ?? null,
+    size: raw.file_size ?? null,
+  };
+}
+
+function toHit(raw: RawHit): SearchHit {
+  const distance = raw.cosine_dist;
+  return {
+    text: raw.split_text ?? "",
+    documentUid: raw.source_doc_uid ?? "",
+    documentName: raw.doc_name ?? "",
+    title: raw.title ?? null,
+    summary: raw.summary ?? null,
+    distance,
+    similarity: typeof distance === "number" ? 1 - distance : undefined,
+    pageNumber: raw.page_number ?? null,
+    location: raw.source_location ?? null,
+    startMs: raw.start_ms ?? null,
+    endMs: raw.end_ms ?? null,
+    rerankScore: raw.rerank_score ?? null,
+    splitUid: raw.text_split_uid ?? null,
+  };
+}
+
+// The job queue's status ids, as names a caller can read.
+const STATUS: Record<number, UploadedFile["status"]> = {
+  [-1]: "failed",
+  0: "pending",
+  1: "working",
+  2: "searchable",
+  3: "finished",
+};
+
+function toUploadStatus(jobId: number, raw: RawJobStatus | null): UploadStatus {
+  const files: UploadedFile[] = (raw?.queue ?? []).map((q) => ({
+    name: q.object_name ?? "",
+    documentUid: q.object_uid ?? null,
+    status: STATUS[q.status_id ?? 0] ?? "pending",
+    error: q.extra || null,
+  }));
+  const searchable = (f: UploadedFile) => f.status === "searchable" || f.status === "finished";
+  const failed = files.filter((f) => f.status === "failed");
+  // Every file accounted for, and none still in the pipeline. "searchable"
+  // counts as an end: the document answers searches while its summary is
+  // still being written.
+  const done =
+    files.length > 0 &&
+    files.length >= (raw?.total_files ?? 0) &&
+    files.every((f) => searchable(f) || f.status === "failed");
+  return {
+    jobId,
+    files,
+    done,
+    ready: done && failed.length === 0,
+    documentUids: files
+      .filter((f) => searchable(f) && f.documentUid)
+      .map((f) => f.documentUid as UUID),
+    failed,
   };
 }
 
@@ -100,84 +200,118 @@ export class Knowledge {
     return (unwrap(raw) ?? []).map(toCollection);
   }
 
-  async listDocuments(options: { collection?: UUID; limit?: number } = {}): Promise<
-    KnowledgeDocument[]
-  > {
+  /**
+   * Documents this credential may read, optionally in one collection.
+   *
+   * `search` matches the file name, title or summary — it is a filter, not a
+   * semantic search; for that, use `search()`.
+   */
+  async listDocuments(
+    options: { collection?: UUID; limit?: number; skip?: number; search?: string } = {},
+  ): Promise<KnowledgeDocument[]> {
     const raw = await this.transport.request<Envelope<RawDocument[]>>({
       path: "/api/v1/documents",
-      query: { collection_uid: options.collection, limit: options.limit },
+      query: {
+        collection: options.collection,
+        limit: options.limit,
+        skip: options.skip,
+        searchTerm: options.search,
+      },
     });
-    return (unwrap(raw) ?? []).map(toDocument);
+    return (unwrap(raw) ?? []).map((d) => toDocument(d, options.collection));
   }
 
   /**
    * Upload a file into a collection.
    *
-   * Returns as soon as the file is accepted. It is NOT searchable yet — the
-   * worker still has to split, embed and index it. Follow with
-   * `waitForProcessing()` if the next thing you do is query.
+   * Resolves as soon as the file is accepted, with the indexing job it joined.
+   * It is NOT searchable yet — the worker still has to split, embed and index
+   * it. Follow with `waitForProcessing()` if the next thing you do is query;
+   * that is also where the new document's uid and any read failure come back.
    */
-  async upload(
-    file: Blob | File,
-    options: { collection: UUID; name?: string },
-  ): Promise<KnowledgeDocument> {
+  async upload(file: Blob | File, options: { collection: UUID; name?: string }): Promise<UploadJob> {
     const form = new FormData();
     const filename = options.name ?? (file instanceof File ? file.name : "upload");
-    form.append("file", file, filename);
-    form.append("collection_uid", options.collection);
+    // `files`, plural: the endpoint takes several in one job.
+    form.append("files", file, filename);
+    form.append("collection", options.collection);
 
     // Multipart: `rawBody` so fetch sets the boundary itself. An upload is
     // also never retried — a repeat would ingest the file twice.
-    const response = await this.transport.raw({
+    const raw = await this.transport.request<{ job_queue_run_id?: number; message?: string }>({
       method: "POST",
-      path: "/api/v1/documents/upload",
+      path: "/api/v1/documents/job-queue-upload",
       rawBody: form,
       idempotent: false,
-      stream: true,
     });
-    const raw = (await response.json()) as Envelope<RawDocument> | RawDocument;
-    return toDocument(unwrap(raw) as RawDocument);
+    return { jobId: raw?.job_queue_run_id ?? 0, message: raw?.message ?? "" };
   }
 
-  /** Search the corpus directly, without going through a conversation. */
-  async search(
-    query: string,
-    options: { collections?: UUID[]; limit?: number } = {},
-  ): Promise<KnowledgeDocument[]> {
-    const raw = await this.transport.request<Envelope<RawDocument[]>>({
-      method: "POST",
-      path: "/api/v1/conversations/similarity-search",
-      body: {
-        query,
-        collections: options.collections ?? [],
-        limit: options.limit ?? 8,
-      },
+  /** Where an upload's indexing job has got to, without waiting. */
+  async uploadStatus(job: UploadJob | number): Promise<UploadStatus> {
+    const jobId = typeof job === "number" ? job : job.jobId;
+    // Not enveloped, unlike the rest of this service.
+    const raw = await this.transport.request<RawJobStatus | null>({
+      path: `/api/v1/documents/job-queue-status/${jobId}`,
     });
-    return (unwrap(raw) ?? []).map(toDocument);
+    return toUploadStatus(jobId, raw);
   }
 
   /**
-   * Poll until a document is embedded, or give up.
+   * Poll until every file in the job is searchable or has failed.
    *
+   * Resolves with the last status either way: `ready` when every file is
+   * searchable; check `done` and `failed` to tell a failure from a timeout.
    * There is no push signal for this, so polling is the honest answer rather
-   * than a workaround. Returns true when it is ready, false on timeout.
+   * than a workaround.
+   *
+   * Large files take longer than the default allows, and a recording is
+   * transcribed before it becomes a document at all — raise `timeoutMs` for
+   * those.
    */
   async waitForProcessing(
-    uid: UUID,
+    job: UploadJob | number,
     options: { timeoutMs?: number; intervalMs?: number } = {},
-  ): Promise<boolean> {
-    const timeout = options.timeoutMs ?? 120_000;
+  ): Promise<UploadStatus> {
+    const deadline = Date.now() + (options.timeoutMs ?? 120_000);
     const interval = options.intervalMs ?? 2_000;
-    const deadline = Date.now() + timeout;
-
-    while (Date.now() < deadline) {
-      const raw = await this.transport.request<Envelope<RawDocument> | RawDocument>({
-        path: `/api/v1/documents/${uid}`,
-      });
-      const doc = unwrap(raw) as RawDocument | undefined;
-      if (doc?.processed || doc?.embedded) return true;
+    while (true) {
+      const status = await this.uploadStatus(job);
+      if (status.done || Date.now() >= deadline) return status;
       await new Promise((resolve) => setTimeout(resolve, interval));
     }
-    return false;
+  }
+
+  /**
+   * The passages that best match `query`, closest first.
+   *
+   * Searches every collection this credential may read unless `collections`
+   * narrows it.
+   */
+  async search(
+    query: string,
+    options: { collections?: UUID[]; limit?: number } = {},
+  ): Promise<SearchHit[]> {
+    const body: Record<string, unknown> = { prompt: query, top_k: options.limit ?? 8 };
+    // Only when there are some. An empty list is not "everything": the
+    // service turns it into a query that fails.
+    if (options.collections?.length) body["collections"] = options.collections;
+    const raw = await this.transport.request<Envelope<RawHit[]>>({
+      method: "POST",
+      // The trailing slash is part of the route.
+      path: "/api/v1/similarity_search/",
+      body,
+    });
+    return (unwrap(raw) ?? []).map(toHit);
+  }
+
+  /** Delete a document, from every collection it is in. */
+  async deleteDocument(uid: UUID): Promise<void> {
+    // Not retried: a repeat after a delete that did land answers 404.
+    await this.transport.request({
+      method: "DELETE",
+      path: `/api/v1/documents/${uid}`,
+      idempotent: false,
+    });
   }
 }

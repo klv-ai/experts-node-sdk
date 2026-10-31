@@ -20,12 +20,20 @@
  *    turn bills twice and can produce two answers.
  */
 
-import { errorFromResponse, ExpertsAbortError, ExpertsServerError } from "./errors.js";
+import {
+  errorFromResponse,
+  ExpertsAbortError,
+  ExpertsError,
+  ExpertsServerError,
+} from "./errors.js";
 
 export interface Credentials {
   /** Server-side `sk-` key. Never send this from a browser. */
   apiKey?: string;
-  /** Browser session token, or any user JWT. */
+  /**
+   * Browser session token, or a user JWT. Not an OAuth sign-in token minted
+   * for the MCP server or the docs viewer: those only work there.
+   */
   token?: string;
 }
 
@@ -159,7 +167,7 @@ export class Transport {
           throw new ExpertsAbortError("The request was cancelled", { cause });
         }
         // Anything already typed is a decision, not a transport failure.
-        if (cause instanceof Error && cause.name.startsWith("Experts")) throw cause;
+        if (cause instanceof ExpertsError) throw cause;
         if (attempt < attempts) {
           lastError = cause;
           await sleep(backoffMs(attempt, null));

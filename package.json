@@ -1,6 +1,6 @@
 {
   "name": "@klv-ai/experts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Official Node/TypeScript SDK for the Klavi Experts API — conversations, streaming, experts, and knowledge.",
   "license": "MIT",
   "author": "Klavi AI",

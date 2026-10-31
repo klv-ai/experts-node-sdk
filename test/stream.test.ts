@@ -182,3 +182,82 @@ describe("terminal event", () => {
     expect(event.sourceDocs).toEqual([]);
   });
 });
+
+describe("mesh", () => {
+  // Experts Mesh (build pack 1.1): who answered, and waiting in line.
+  const done = { type: "stream", message: { content: "" }, done: true };
+
+  it("makes waiting in line its own event, not content", () => {
+    expect(
+      toEvent({ type: "mesh_waiting", node: "n-tokyo", name: "Tokyo", ahead: 2, done: false, response: "r" }),
+    ).toEqual({ type: "queued", ahead: 2, node: "n-tokyo", name: "Tokyo", rerouting: false });
+  });
+
+  it("flags a reroute", () => {
+    const event = toEvent({ type: "mesh_waiting", name: "Tokyo", ahead: 0, rerouting: true, done: false });
+    expect(event).toMatchObject({ type: "queued", rerouting: true });
+  });
+
+  it("names another member's model", () => {
+    const event = toEvent({
+      ...done,
+      model: "gemma4:12b",
+      served_by: {
+        node: "n-tokyo",
+        name: "Tokyo",
+        label: "Tokyo GPU",
+        model: "gemma4:12b",
+        route: [
+          { node: "n-lis", name: "Lisbon" },
+          { node: "n-tokyo", name: "Tokyo" },
+        ],
+      },
+    });
+    expect(event).toMatchObject({
+      type: "done",
+      model: "gemma4:12b",
+      servedBy: { name: "Tokyo", route: ["Lisbon", "Tokyo"] },
+    });
+  });
+
+  it("says what was out of reach on a fallback", () => {
+    const event = toEvent({
+      ...done,
+      mesh_fallback: { node: "n-chi", name: "Chicago", model: "llama3:70b", reason: "unreachable", answered_with: "gemma4:12b" },
+    });
+    expect(event).toMatchObject({
+      meshFallback: { name: "Chicago", reason: "unreachable", answeredWith: "gemma4:12b" },
+    });
+  });
+
+  it("carries a strict expert's unreachable model as an error", () => {
+    const event = toEvent({ ...done, error: "Chicago is unreachable", mesh_unavailable: { name: "Chicago" } });
+    expect(event).toMatchObject({ error: "Chicago is unreachable", meshUnavailable: { name: "Chicago" } });
+  });
+});
+
+describe("tool outputs", () => {
+  it("carries data artifacts and generated images", () => {
+    const event = toEvent({
+      type: "stream",
+      message: { content: "" },
+      done: true,
+      data_artifacts: [{ id: "a1", kind: "chart" }, "junk"],
+      generated_images: [{ url: "/img/1.png" }],
+    });
+    expect(event).toMatchObject({
+      dataArtifacts: [{ id: "a1", kind: "chart" }],
+      generatedImages: [{ url: "/img/1.png" }],
+    });
+  });
+
+  it("keeps a cited recording passage's time", () => {
+    const event = toEvent({
+      type: "stream",
+      message: { content: "" },
+      done: true,
+      source_docs: [{ uid: "d", name: "call.m4a", cosine_dist: 0.2, split_uid: "s-9", start_ms: 61000, end_ms: 64500 }],
+    });
+    expect(event).toMatchObject({ sourceDocs: [{ splitUid: "s-9", startMs: 61000, endMs: 64500 }] });
+  });
+});

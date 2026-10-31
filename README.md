@@ -59,7 +59,7 @@ for await (const event of stream) {
   switch (event.type) {
     case "token":     process.stdout.write(event.content); break;
     case "thinking":  /* reasoning tokens, when the model exposes them */ break;
-    case "action":    /* "rag_search", "tool_call" — for a status line */ break;
+    case "queued":    /* waiting in line for another mesh server's model */ break;
     case "done":      console.log(event.usage, event.sourceDocs); break;
   }
 }
@@ -74,12 +74,16 @@ result.sourceDocs;       // documents retrieved, with similarity scores
 result.toolsUsed;        // e.g. ["web_search"]
 result.usage.totalMs;    // milliseconds (the API speaks nanoseconds)
 result.error;            // set when generation failed inside a 200 — always check
+result.model;            // the model that answered
+result.dataArtifacts;    // tables, charts and sheet edits a tool produced
 ```
+
+On an [Experts Mesh](https://klv.ai/mesh), an answer can come from another server's model. `result.servedBy` names that server; `result.meshFallback` says when the expert's own model was out of reach and this server's answered instead. While a busy server's model has the request in line, the stream sends `queued` events (`event.ahead`, `event.name`) and nothing else.
 
 ### Stopping
 
 ```ts
-await stream.cancel();   // stops the model
+await stream.cancel();   // stops the model; true if the server found it running
 stream.detach();         // stop reading; let it finish and persist
 ```
 
@@ -119,39 +123,58 @@ for await (const event of stream) {
 
 The browser entry point has no code path that accepts an `apiKey`, so shipping one to the browser is a type error rather than a leak you find later.
 
-**The expert must be guest-visible.** A session token carries the guest role, and an expert above that floor resolves to nothing server-side — the chat then answers on the site's default model with no persona and no knowledge, silently, with a normal 200. `sessions.create()` refuses such an expert up front and tells you how to fix it. `experts.listGuestVisible()` gives you the ones that will work.
+**The expert must be guest-visible**: minimum role Guest, not private, and not limited to org profiles. A session token carries the guest role, so `sessions.create()` refuses any other expert up front and tells you how to fix it. `experts.listGuestVisible()` gives you the ones that will work.
+
+**On an Experts Mesh, the browser talks to the server you minted on.** A session lives on the server that issued it; another member of the mesh does not know it and answers 401, so give the browser client that server's `baseUrl`.
 
 ## Knowledge
 
 ```ts
 const collections = await experts.knowledge.listCollections();
 
-const doc = await experts.knowledge.upload(file, { collection: collections[0].uid });
+const job = await experts.knowledge.upload(file, { collection: collections[0].uid });
 
-// Uploading is asynchronous: the file is accepted, then split, embedded and
-// indexed by a worker. It is NOT searchable until that finishes.
-await experts.knowledge.waitForProcessing(doc.uid);
+// Uploading is asynchronous: the file is accepted into an indexing job, then
+// split, embedded and indexed by a worker. It is NOT searchable until that
+// finishes — and the job is where the document's uid and any failure appear.
+const status = await experts.knowledge.waitForProcessing(job);
+if (!status.ready) console.log(status.failed); // e.g. a password-protected PDF, and why
 
-const hits = await experts.knowledge.search("refund policy");
+for (const hit of await experts.knowledge.search("refund policy", { collections: [collections[0].uid] })) {
+  console.log(hit.documentName, hit.similarity, hit.text);
+}
 ```
+
+`search()` returns passages, closest first, each with the document it came from. `listDocuments({ collection, search })` lists and filters documents by name, title or summary; `deleteDocument(uid)` removes one. Allow longer than the two-minute default for large files, and much longer for recordings, which are transcribed before they become documents.
 
 ## Errors
 
 ```ts
-import { ExpertsRateLimitError, ExpertsLicenseError } from "@klv-ai/experts";
+import {
+  ExpertNotAvailableError,
+  ExpertsLicenseError,
+  ExpertsRateLimitError,
+} from "@klv-ai/experts";
 
 try {
-  await experts.conversations.ask("hi");
+  await experts.conversations.ask("hi", { expert: EXPERT_UID });
 } catch (error) {
   if (error instanceof ExpertsRateLimitError) {
     await sleep((error.retryAfter ?? 5) * 1000);
   }
+  if (error instanceof ExpertNotAvailableError) {
+    // This key's user may not use that expert (its role, privacy or org
+    // profiles). Pick another from experts.experts.list().
+  }
   if (error instanceof ExpertsLicenseError) {
-    // The INSTALL's licence has lapsed. Nothing about your request is wrong
-    // and no retry will help — its administrator has to renew.
+    // The INSTALL's licence is not valid. Nothing about your request is wrong
+    // and no retry will help — its administrator has to act. error.readOnly
+    // is true for a recently expired licence: reads work, writes do not.
   }
 }
 ```
+
+For 30 days after its licence expires, an install is read-only: anything sent as a GET still works, and everything else throws `ExpertsLicenseReadOnlyError` (an `ExpertsLicenseError`). That includes sending a message and `knowledge.search()`, which read but go out as a POST.
 
 429 and 5xx are retried automatically with backoff that honours `Retry-After`. A 4xx never is. Neither is a chat turn — retrying one bills twice and can produce two answers.
 
@@ -168,6 +191,9 @@ These are the parts of the API that surprise people. The SDK handles each of the
 | **404 can mean "forbidden"** | A conversation you may not see answers 404 so a uid probe reveals nothing. The SDK does not guess which it was. |
 | **Casing is mixed by design** | Conversation rows are camelCase; message and expert rows are snake_case; knowledge responses are wrapped in an envelope. All normalised. |
 | **Streaming is plain HTTP** | NDJSON over `POST`. No WebSocket is required for chat, contrary to some older notes. |
+| **A refused turn leaves a placeholder behind** | `/chat` updates a message row you created first. When it refuses to start, nothing settles that row, and the conversation shows the reply "typing" forever. The SDK settles it with the reason. |
+| **An expert's instructions are for its managers** | Since 1.1, `Expert.instructions` is only filled in for the expert's owner and administrators. |
+| **Knowledge says "forbidden" as 401** | The knowledge service answers a document you may not read with 401. The SDK throws `ExpertsPermissionError`, not `ExpertsAuthError`: the key is fine. |
 
 ## OpenAI-compatible endpoint
 
@@ -192,7 +218,7 @@ Retrieval still happens; source documents come back under a `klavi` key on the f
 
 ## Requirements
 
-Node 22 or later — the SDK uses native `fetch`, `ReadableStream` and `AbortController` and has no runtime dependencies. An install running build pack **1.0.49** or later.
+Node 22 or later — the SDK uses native `fetch`, `ReadableStream` and `AbortController` and has no runtime dependencies. An install running build pack **1.0.49** or later. Tested against **1.1**; the mesh fields and the read-only licence error are only sent by a 1.1 install.
 
 ## Contributing
 

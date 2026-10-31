@@ -14,6 +14,8 @@ import {
   ExpertsAuthError,
   ExpertsBadRequestError,
   ExpertsLicenseError,
+  ExpertsLicenseReadOnlyError,
+  ExpertNotAvailableError,
   ExpertsNotFoundError,
   ExpertsPermissionError,
   ExpertsRateLimitError,
@@ -108,6 +110,10 @@ describe("an expired licence is its own thing", () => {
       .toMatch(/installation's licence|administrator/i);
   });
 
+  it("is not read-only", () => {
+    expect((errorFromResponse({ status: 403, body }) as ExpertsLicenseError).readOnly).toBe(false);
+  });
+
   it("leaves an ordinary 403 alone", () => {
     const error = errorFromResponse({ status: 403, body: { detail: "Not yours" } });
     expect(error).toBeInstanceOf(ExpertsPermissionError);
@@ -135,5 +141,48 @@ describe("carried context", () => {
 
   it("is catchable as a plain Error", () => {
     expect(errorFromResponse({ status: 500, body: {} })).toBeInstanceOf(Error);
+  });
+});
+
+describe("a recently expired licence is read-only", () => {
+  // For 30 days after expiry an install serves reads and refuses writes with
+  // its own code. Callers catching ExpertsLicenseError must still see it.
+  const body = {
+    error: "license_expired_readonly",
+    message:
+      "This licence has expired. The server is read-only until it is renewed; you can still view and export your data.",
+  };
+
+  it("is still a licence error", () => {
+    const error = errorFromResponse({ status: 403, body });
+    expect(error).toBeInstanceOf(ExpertsLicenseReadOnlyError);
+    expect(error).toBeInstanceOf(ExpertsLicenseError);
+    expect(error).not.toBeInstanceOf(ExpertsPermissionError);
+    expect((error as ExpertsLicenseError).readOnly).toBe(true);
+    expect(error.code).toBe("license_expired_readonly");
+    expect(error.message).toMatch(/read-only/);
+  });
+});
+
+describe("structured refusals", () => {
+  it("reads {detail: {reason, message}} rather than reporting the status", () => {
+    const error = errorFromResponse({
+      status: 403,
+      body: { detail: { reason: "expert_not_available", message: "This expert isn't available to you." } },
+    });
+    expect(error).toBeInstanceOf(ExpertNotAvailableError);
+    expect(error).toBeInstanceOf(ExpertsPermissionError);
+    expect(error.code).toBe("expert_not_available");
+    expect(error.message).toBe("This expert isn't available to you.");
+  });
+
+  it("treats the knowledge service's 401 'insufficient permissions' as forbidden", () => {
+    // The key is fine; re-authenticating would not help.
+    const error = errorFromResponse({
+      status: 401,
+      body: { detail: "User has insufficient permissions" },
+    });
+    expect(error).toBeInstanceOf(ExpertsPermissionError);
+    expect(error).not.toBeInstanceOf(ExpertsAuthError);
   });
 });
