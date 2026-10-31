@@ -47,9 +47,12 @@ live("against a real install", () => {
       expect(Array.isArray(expert.starters)).toBe(true);
     });
 
-    it("reports guest visibility, which browser sessions depend on", () => {
-      const guests = experts.filter((e) => !e.private && e.minRoleId <= 1);
-      for (const expert of guests) expect(expert.minRoleId).toBeLessThanOrEqual(1);
+    it("reports guest visibility, which browser sessions depend on", async () => {
+      const visible = new Set((await client.experts.listGuestVisible()).map((e) => e.uid));
+      for (const expert of experts) {
+        const expected = !expert.private && expert.minRoleId <= 1 && expert.scopeUids.length === 0;
+        expect(visible.has(expert.uid)).toBe(expected);
+      }
     });
   });
 
@@ -163,11 +166,40 @@ live("against a real install", () => {
         });
       }
     });
+
+    it("uploads, indexes, finds and deletes a document", async () => {
+      // The round trip the 0.1 release shipped without ever exercising: every
+      // step of it was against the wrong field or the wrong route.
+      const collections = await client.knowledge.listCollections();
+      const collection = collections[0]?.uid;
+      if (!collection) return; // this key can see no collection to upload into
+      const word = `sdkprobe${Math.random().toString(36).slice(2, 12)}`;
+
+      const job = await client.knowledge.upload(
+        new Blob([`Klavi SDK live test. The probe word is ${word}.`]),
+        { collection, name: `${word}.txt` },
+      );
+      expect(job.jobId).toBeGreaterThan(0);
+      const status = await client.knowledge.waitForProcessing(job, { timeoutMs: 180_000 });
+      expect(status.ready).toBe(true);
+      const docUid = status.documentUids[0]!;
+      try {
+        const listed = await client.knowledge.listDocuments({ collection });
+        expect(listed.find((d) => d.uid === docUid)).toMatchObject({
+          name: `${word}.txt`,
+          collectionUid: collection,
+        });
+        const hits = await client.knowledge.search(word, { collections: [collection], limit: 3 });
+        expect(hits.some((h) => h.documentUid === docUid && h.text.includes(word))).toBe(true);
+      } finally {
+        await client.knowledge.deleteDocument(docUid);
+      }
+    }, 200_000);
   });
 
   describe("browser sessions", () => {
     it("mints a token bound to one expert and conversation", async () => {
-      const guest = experts.find((e) => !e.private && e.minRoleId <= 1);
+      const guest = (await client.experts.listGuestVisible())[0];
       if (!guest) return; // no guest-visible expert on this install
 
       const origin = process.env["EXPERTS_TEST_ORIGIN"];

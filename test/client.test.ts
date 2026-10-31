@@ -12,8 +12,10 @@ import { describe, expect, it, vi } from "vitest";
 import { ExpertsClient } from "../src/client.js";
 import { ExpertsBrowserClient } from "../src/browser-client.js";
 import {
+  ExpertNotAvailableError,
   ExpertsAuthError,
   ExpertsLicenseError,
+  ExpertsStreamError,
   ExpertsNotFoundError,
   ExpertsPermissionError,
   ExpertsRateLimitError,
@@ -204,6 +206,76 @@ describe("cancelling", () => {
 
     expect(new URL(calls[3]!.url).pathname).toBe("/api/v1/conversations/chat/stub-row/cancel");
   });
+
+  it("reports whether there was anything to stop", async () => {
+    const turn = (cancelled: boolean) => [
+      { json: { uid: "user-row" } },
+      { json: { uid: "stub-row" } },
+      { ndjson: [JSON.stringify({ type: "stream", message: { content: "x" }, done: false })] },
+      { json: { cancelled } },
+    ];
+    for (const cancelled of [true, false]) {
+      const { sdk } = client(turn(cancelled));
+      const stream = await sdk.conversations.send("conv-1", "hi");
+      await expect(stream.cancel()).resolves.toBe(cancelled);
+    }
+  });
+});
+
+describe("a turn refused before it starts", () => {
+  // Build pack 1.1 refuses an expert the caller may not use, where 1.0
+  // silently answered on the default model.
+  const refusal = {
+    status: 403,
+    json: { detail: { reason: "expert_not_available", message: "This expert isn't available to you." } },
+  };
+
+  it("raises ExpertNotAvailableError and settles the placeholder", async () => {
+    const { sdk, calls } = client([
+      { json: { uid: "user-row" } },
+      { json: { uid: "stub-row" } },
+      refusal,
+      { json: { uid: "stub-row", done: true } },
+    ]);
+    await expect(sdk.conversations.send("conv-1", "hi", { expert: "e-locked" })).rejects.toBeInstanceOf(
+      ExpertNotAvailableError,
+    );
+    // Otherwise nothing ever writes the row, and the conversation shows the
+    // reply "typing" forever.
+    expect(calls[3]?.method).toBe("PUT");
+    expect(new URL(calls[3]!.url).pathname).toBe("/api/v1/responses/");
+    expect(calls[3]?.body).toEqual({
+      uid: "stub-row",
+      done: true,
+      text: "",
+      error: "This expert isn't available to you.",
+    });
+  });
+});
+
+describe("a connection dropped mid-answer", () => {
+  it("is a stream error, not fetch's bare TypeError", async () => {
+    const encoder = new TextEncoder();
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(JSON.stringify({ type: "stream", message: { content: "Hel" }, done: false }) + "\n"));
+        controller.error(new TypeError("terminated"));
+      },
+    });
+    const replies = [{ json: { uid: "user-row" } }, { json: { uid: "stub-row" } }];
+    let i = 0;
+    const fetchImpl = (async () =>
+      i < replies.length
+        ? new Response(JSON.stringify(replies[i++]!.json), { headers: { "content-type": "application/json" } })
+        : new Response(broken, { headers: { "content-type": "application/x-ndjson" } })) as unknown as typeof fetch;
+    const sdk = new ExpertsClient({ apiKey: "sk-test", baseUrl: "https://install.example", fetch: fetchImpl, maxRetries: 1 });
+
+    const stream = await sdk.conversations.send("conv-1", "hi");
+    const error = await stream.text().catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ExpertsStreamError);
+    expect((error as ExpertsStreamError).code).toBe("incomplete_stream");
+    expect((error as Error).message).toMatch(/re-read the conversation/);
+  });
 });
 
 describe("errors", () => {
@@ -284,9 +356,13 @@ describe("normalisation", () => {
           { uid: "guest-ok", name: "A", min_role_id: 1, private: false },
           { uid: "too-high", name: "B", min_role_id: 2, private: false },
           { uid: "is-private", name: "C", min_role_id: 1, private: true },
+          // Limited to org profiles: a visitor is in none of them, and
+          // minting a session for it is refused.
+          { uid: "scoped", name: "D", min_role_id: 1, private: false, scope_uids: ["s1"] },
+          { uid: "unscoped", name: "E", min_role_id: 1, private: false, scope_uids: null },
         ],
       },
     ]);
-    expect((await sdk.experts.listGuestVisible()).map((e) => e.uid)).toEqual(["guest-ok"]);
+    expect((await sdk.experts.listGuestVisible()).map((e) => e.uid)).toEqual(["guest-ok", "unscoped"]);
   });
 });

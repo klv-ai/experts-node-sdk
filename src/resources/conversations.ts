@@ -18,14 +18,13 @@
  */
 
 import type { Transport } from "../http.js";
-import { ChatStream, readNdjson } from "../stream.js";
-import { ExpertsStreamError } from "../errors.js";
+import { ChatStream, readNdjson, sourceDocs } from "../stream.js";
+import { ExpertsError, ExpertsStreamError } from "../errors.js";
 import type {
   Conversation,
   ConversationWithMessages,
   Message,
   SendOptions,
-  SourceDocument,
   UUID,
 } from "../types.js";
 
@@ -84,7 +83,8 @@ function toMessage(raw: RawMessage): Message {
     done: raw.done ?? true,
     index: raw.index ?? 0,
     createdAt: raw.created_at ?? null,
-    sourceDocs: (raw.source_docs ?? []) as SourceDocument[],
+    // Shaped exactly as the done event's are: distance AND similarity, camelCase.
+    sourceDocs: sourceDocs(raw.source_docs),
     error: raw.error ?? null,
     aborted: raw.aborted ?? false,
   };
@@ -241,22 +241,31 @@ export class Conversations {
     });
 
     // 3. Generate. Streams NDJSON over plain HTTP.
-    const response = await this.transport.raw({
-      method: "POST",
-      path: "/api/v1/conversations/chat",
-      body: {
-        conversationUid,
-        question,
-        response: placeholder.uid,
-        expert: options.expert,
-        model: options.model,
-        images: options.images,
-        context: options.context,
-      },
-      stream: true,
-      signal: options.signal,
-      headers: { accept: "application/x-ndjson" },
-    });
+    let response: Response;
+    try {
+      response = await this.transport.raw({
+        method: "POST",
+        path: "/api/v1/conversations/chat",
+        body: {
+          conversationUid,
+          question,
+          response: placeholder.uid,
+          expert: options.expert,
+          model: options.model,
+          images: options.images,
+          context: options.context,
+        },
+        stream: true,
+        signal: options.signal,
+        headers: { accept: "application/x-ndjson" },
+      });
+    } catch (error) {
+      // Refused before it started (an expert this key may not use, a
+      // read-only licence). Nothing will ever write the placeholder, so settle
+      // it with the reason, or the conversation shows it typing forever.
+      if (error instanceof ExpertsError) await this.settle(placeholder.uid, error.message);
+      throw error;
+    }
 
     if (!response.body) {
       throw new ExpertsStreamError("The server returned no response body");
@@ -267,14 +276,30 @@ export class Conversations {
       conversationUid,
       responseUid: placeholder.uid,
       cancelFn: async (responseUid) => {
-        if (!responseUid) return;
-        await this.transport.request({
+        if (!responseUid) return false;
+        const raw = await this.transport.request<{ cancelled?: boolean } | null>({
           method: "POST",
           path: `/api/v1/conversations/chat/${responseUid}/cancel`,
           idempotent: false,
         });
+        // False when nothing was running to stop: already finished, or running
+        // in another conversations process than the one asked.
+        return raw?.cancelled === true;
       },
     });
+  }
+
+  /** Mark a placeholder finished, with the reason it never got an answer. */
+  private async settle(responseUid: string, error: string): Promise<void> {
+    // Best effort: the refusal is what the caller needs to see, never a
+    // failure to tidy up after it.
+    await this.transport
+      .request({
+        method: "PUT",
+        path: "/api/v1/responses/",
+        body: { uid: responseUid, done: true, text: "", error },
+      })
+      .catch(() => undefined);
   }
 
   /** Create a conversation and send the first message in one call. */

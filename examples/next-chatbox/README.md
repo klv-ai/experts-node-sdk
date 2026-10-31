@@ -28,11 +28,9 @@ infrastructure.
 1. **Register the origin** against your API key in the install's admin
    (`https://acme.com`, exactly as the browser sends it). This is also what
    supplies CORS for the surface.
-2. **Make the expert guest-visible** — minimum role Guest, not private. A
-   session token is a guest, and an expert above that floor resolves to
-   nothing server-side: the chat would answer on the site's default model with
-   no persona and no knowledge, silently. `sessions.create()` refuses such an
-   expert and says so.
+2. **Make the expert guest-visible** — minimum role Guest, not private, and
+   not limited to org profiles. A session token is a guest, so
+   `sessions.create()` refuses any other expert and says so.
 
 ## Files
 

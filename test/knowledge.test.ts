@@ -6,6 +6,10 @@
  * are snake_case, and timestamps are epoch milliseconds rather than ISO
  * strings. A caller should not have to know which service answered, so all
  * three are normalised here — and these tests are what keep that true.
+ *
+ * The payloads are copied from a 1.1 install (build pack 1.1.0-rc.127). The
+ * 0.1 release mocked the shapes it expected instead, which is how its upload,
+ * search and processing wait shipped without ever having worked.
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -15,6 +19,7 @@ import { ExpertsClient } from "../src/client.js";
 function client(replies: Array<{ status?: number; json?: unknown }>) {
   let index = 0;
   const calls: Array<{ url: string; method: string; body: unknown }> = [];
+  const body = (i: number) => JSON.parse(String(calls[i]?.body)) as Record<string, unknown>;
   const impl = vi.fn(async (url: string | URL, init?: RequestInit) => {
     calls.push({
       url: String(url),
@@ -29,6 +34,7 @@ function client(replies: Array<{ status?: number; json?: unknown }>) {
   });
   return {
     calls,
+    body,
     sdk: new ExpertsClient({
       apiKey: "sk-test",
       baseUrl: "https://install.example",
@@ -75,14 +81,66 @@ describe("the envelope", () => {
   });
 });
 
-describe("row normalisation", () => {
-  it("camelises snake_case fields", async () => {
+const COLLECTION = "d0f5ac46-0000-4000-8000-000000000001";
+const DOC = "54137bfb-f499-4502-81d3-8bf1ab0970a6";
+
+function jobStatus(queue: Array<Record<string, unknown>>, total = 1) {
+  // Not enveloped, unlike the rest of the knowledge service.
+  return {
+    id: 24,
+    kind: 0,
+    total_files: total,
+    error_count: 0,
+    queue,
+    queue_total: queue.length,
+    has_more: false,
+  };
+}
+
+function entry(statusId: number, extra: Record<string, unknown> = {}) {
+  return { status_id: statusId, object_uid: DOC, object_name: "policy.txt", extra: null, ...extra };
+}
+
+describe("documents", () => {
+  it("maps rows from their wire names", async () => {
     const { sdk } = client([
-      { json: { ...ENVELOPE, data: [{ uid: "d1", name: "x", collection_uid: "c1" }] } },
+      {
+        json: {
+          ...ENVELOPE,
+          data: [
+            {
+              uid: DOC,
+              doc_name: "policy.pdf",
+              doc_type: "pdf",
+              title: "Refund policy",
+              summary: "How refunds work.",
+              file_size: 2048,
+            },
+          ],
+        },
+      },
     ]);
-    expect((await sdk.knowledge.listDocuments())[0]).toMatchObject({
-      uid: "d1",
-      collectionUid: "c1",
+    expect((await sdk.knowledge.listDocuments({ collection: COLLECTION }))[0]).toMatchObject({
+      uid: DOC,
+      name: "policy.pdf",
+      type: "pdf",
+      title: "Refund policy",
+      summary: "How refunds work.",
+      description: "How refunds work.",
+      size: 2048,
+      // The row names no collection; the one it was listed from is kept.
+      collectionUid: COLLECTION,
+    });
+  });
+
+  it("filters by the parameter the server reads", async () => {
+    const { sdk, calls } = client([{ json: { ...ENVELOPE, data: [] } }]);
+    await sdk.knowledge.listDocuments({ collection: COLLECTION, limit: 5, search: "refund" });
+    const url = new URL(calls[0]?.url ?? "");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      collection: COLLECTION,
+      limit: "5",
+      searchTerm: "refund",
     });
   });
 
@@ -109,26 +167,13 @@ describe("row normalisation", () => {
     const { sdk } = client([{ json: { ...ENVELOPE, data: [{ uid: "d1" }] } }]);
     expect((await sdk.knowledge.listDocuments())[0]?.createdAt).toBeNull();
   });
-});
 
-describe("processing", () => {
-  it("reports ready once the worker has embedded the document", async () => {
-    const { sdk } = client([
-      { json: { ...ENVELOPE, data: { uid: "d1", processed: false } } },
-      { json: { ...ENVELOPE, data: { uid: "d1", processed: true } } },
+  it("deletes", async () => {
+    const { sdk, calls } = client([{ json: { status: 204, message: "Deleted" } }]);
+    await sdk.knowledge.deleteDocument(DOC);
+    expect(calls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual([
+      `DELETE /api/v1/documents/${DOC}`,
     ]);
-    await expect(
-      sdk.knowledge.waitForProcessing("d1", { timeoutMs: 5_000, intervalMs: 1 }),
-    ).resolves.toBe(true);
-  });
-
-  it("gives up rather than hanging forever", async () => {
-    // Uploading is asynchronous and a stuck worker is a real state. A caller
-    // needs to be told, not left waiting.
-    const { sdk } = client([{ json: { ...ENVELOPE, data: { uid: "d1", processed: false } } }]);
-    await expect(
-      sdk.knowledge.waitForProcessing("d1", { timeoutMs: 30, intervalMs: 5 }),
-    ).resolves.toBe(false);
   });
 });
 
@@ -136,15 +181,119 @@ describe("upload", () => {
   it("sends multipart and is never retried", async () => {
     // A retried upload ingests the file twice, which then shows up as
     // duplicate retrieval hits.
-    const { sdk, calls } = client([{ json: { ...ENVELOPE, data: { uid: "d1", name: "x" } } }]);
-    await sdk.knowledge.upload(new Blob(["hello"]), { collection: "c1", name: "x.txt" });
+    const { sdk, calls } = client([{ status: 503, json: { detail: "busy" } }]);
+    await expect(
+      sdk.knowledge.upload(new Blob(["hello"]), { collection: COLLECTION, name: "x.txt" }),
+    ).rejects.toThrow();
     expect(calls).toHaveLength(1);
     expect(calls[0]?.body).toBeInstanceOf(FormData);
   });
 
-  it("carries the collection so the file lands somewhere", async () => {
-    const { sdk, calls } = client([{ json: { ...ENVELOPE, data: { uid: "d1" } } }]);
-    await sdk.knowledge.upload(new Blob(["hello"]), { collection: "c1" });
-    expect((calls[0]?.body as FormData).get("collection_uid")).toBe("c1");
+  it("uses the form fields the server reads, and answers with the job", async () => {
+    // `files`, plural, and `collection` — anything else is a 422, or a file
+    // that lands in no collection.
+    const { sdk, calls } = client([
+      {
+        json: {
+          timestamp: 1,
+          status: 200,
+          message: "Processing 1 files on the embedding queue",
+          job_queue_run_id: 24,
+        },
+      },
+    ]);
+    const job = await sdk.knowledge.upload(new Blob(["hello"]), {
+      collection: COLLECTION,
+      name: "policy.txt",
+    });
+    expect(job).toEqual({ jobId: 24, message: "Processing 1 files on the embedding queue" });
+    const form = calls[0]?.body as FormData;
+    expect(form.get("collection")).toBe(COLLECTION);
+    expect((form.get("files") as File).name).toBe("policy.txt");
+  });
+});
+
+describe("processing", () => {
+  it("polls the job until the file is searchable", async () => {
+    const { sdk, calls } = client([
+      { json: jobStatus([]) }, // accepted, not yet queued
+      { json: jobStatus([entry(1)]) }, // working
+      { json: jobStatus([entry(2)]) }, // searchable, summary pending
+    ]);
+    const status = await sdk.knowledge.waitForProcessing(24, { intervalMs: 1 });
+    expect(status).toMatchObject({ jobId: 24, done: true, ready: true, documentUids: [DOC] });
+    expect(calls.map((c) => new URL(c.url).pathname)).toEqual(
+      Array(3).fill("/api/v1/documents/job-queue-status/24"),
+    );
+  });
+
+  it("says why a file failed", async () => {
+    const { sdk } = client([
+      { json: jobStatus([entry(-1, { object_uid: null, extra: "This PDF is password-protected." })]) },
+    ]);
+    const status = await sdk.knowledge.waitForProcessing({ jobId: 24, message: "" });
+    expect(status.done).toBe(true);
+    expect(status.ready).toBe(false);
+    expect(status.failed[0]?.error).toBe("This PDF is password-protected.");
+  });
+
+  it("gives up rather than hanging forever", async () => {
+    // Uploading is asynchronous and a stuck worker is a real state. A caller
+    // needs to be told, not left waiting.
+    const { sdk } = client([{ json: jobStatus([entry(1)]) }]);
+    const status = await sdk.knowledge.waitForProcessing(24, { timeoutMs: 30, intervalMs: 5 });
+    expect(status.done).toBe(false);
+    expect(status.ready).toBe(false);
+    expect(status.files[0]?.status).toBe("working");
+  });
+});
+
+describe("search", () => {
+  const HIT = {
+    cosine_dist: 0.25,
+    split_text: "Refunds are issued within 14 days.",
+    split_order: 0,
+    text_split_uid: "split-1",
+    source_doc_uid: DOC,
+    doc_name: "policy.txt",
+    title: null,
+    summary: null,
+    doc_uri: "",
+    page_number: 3,
+    source_location: null,
+    start_ms: null,
+    end_ms: null,
+    match_source: "both",
+    rrf_score: null,
+    rerank_score: 0.9,
+  };
+
+  it("is the RAG search, with the body it takes", async () => {
+    const { sdk, calls, body } = client([{ json: { ...ENVELOPE, data: [] } }]);
+    await sdk.knowledge.search("refunds", { collections: [COLLECTION], limit: 3 });
+    expect(new URL(calls[0]?.url ?? "").pathname).toBe("/api/v1/similarity_search/");
+    expect(body(0)).toEqual({ prompt: "refunds", top_k: 3, collections: [COLLECTION] });
+  });
+
+  it("leaves collections out when there are none", async () => {
+    // An empty list is not "everything" to the service: it builds a query
+    // that fails with a 500.
+    const { sdk, body } = client([{ json: { ...ENVELOPE, data: [] } }]);
+    await sdk.knowledge.search("refunds");
+    expect(body(0)).not.toHaveProperty("collections");
+  });
+
+  it("answers with passages and their documents", async () => {
+    const { sdk } = client([{ json: { ...ENVELOPE, data: [HIT] } }]);
+    const [hit] = await sdk.knowledge.search("refunds");
+    expect(hit).toMatchObject({
+      text: "Refunds are issued within 14 days.",
+      documentUid: DOC,
+      documentName: "policy.txt",
+      pageNumber: 3,
+      rerankScore: 0.9,
+      splitUid: "split-1",
+    });
+    expect(hit?.similarity).toBeCloseTo(0.75);
   });
 });

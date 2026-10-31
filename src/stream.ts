@@ -27,8 +27,16 @@
  *    `detach()` is the deliberate "leave it running" case.
  */
 
-import type { ChatEvent, ChatResult, SourceDocument, Usage } from "./types.js";
-import { ExpertsStreamError } from "./errors.js";
+import type {
+  AnswerDetails,
+  ChatEvent,
+  ChatResult,
+  MeshFallback,
+  ServedBy,
+  SourceDocument,
+  Usage,
+} from "./types.js";
+import { ExpertsAbortError, ExpertsError, ExpertsStreamError } from "./errors.js";
 
 /** Split a byte stream into NDJSON events, preserving partial lines. */
 export async function* readNdjson(
@@ -107,7 +115,8 @@ function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" ? value : undefined;
 }
 
-function sourceDocs(raw: unknown): SourceDocument[] {
+/** Source documents as the SDK shapes them, from a done event or a message row. */
+export function sourceDocs(raw: unknown): SourceDocument[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((doc: Record<string, unknown>) => ({
     uid: String(doc["uid"] ?? ""),
@@ -121,7 +130,63 @@ function sourceDocs(raw: unknown): SourceDocument[] {
     distance: numberOrUndefined(doc["cosine_dist"]),
     similarity:
       typeof doc["cosine_dist"] === "number" ? 1 - doc["cosine_dist"] : undefined,
+    splitUid: stringOrUndefined(doc["split_uid"]),
+    startMs: numberOrUndefined(doc["start_ms"]),
+    endMs: numberOrUndefined(doc["end_ms"]),
   }));
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function servedBy(raw: unknown): ServedBy | undefined {
+  const r = record(raw);
+  if (!r) return undefined;
+  return {
+    node: String(r["node"] ?? ""),
+    name: String(r["name"] ?? ""),
+    label: String(r["label"] ?? ""),
+    model: String(r["model"] ?? ""),
+    route: Array.isArray(r["route"])
+      ? (r["route"] as unknown[])
+          .map(record)
+          .filter((hop): hop is Record<string, unknown> => hop !== undefined)
+          .map((hop) => String(hop["name"] ?? hop["node"] ?? ""))
+      : [],
+  };
+}
+
+function meshFallback(raw: unknown): MeshFallback | undefined {
+  const r = record(raw);
+  if (!r) return undefined;
+  return {
+    node: String(r["node"] ?? ""),
+    name: String(r["name"] ?? ""),
+    model: String(r["model"] ?? ""),
+    reason: String(r["reason"] ?? ""),
+    answeredWith: String(r["answered_with"] ?? ""),
+  };
+}
+
+/** Who answered, and what tools produced, from a terminal event. */
+function answerDetails(raw: Record<string, unknown>): AnswerDetails {
+  return {
+    model: stringOrUndefined(raw["model"]),
+    servedBy: servedBy(raw["served_by"]),
+    meshFallback: meshFallback(raw["mesh_fallback"]),
+    meshUnavailable: record(raw["mesh_unavailable"]),
+    generatedImages: Array.isArray(raw["generated_images"])
+      ? (raw["generated_images"] as unknown[])
+      : [],
+    dataArtifacts: Array.isArray(raw["data_artifacts"])
+      ? (raw["data_artifacts"] as unknown[])
+          .map(record)
+          .filter((a): a is Record<string, unknown> => a !== undefined)
+      : [],
+  };
 }
 
 /** Turn one raw NDJSON event into the SDK's typed union, or null to skip it. */
@@ -136,6 +201,17 @@ export function toEvent(raw: Record<string, unknown>): ChatEvent | null {
   }
   if (type === "thinking") {
     return { type: "thinking", content };
+  }
+  if (type === "mesh_waiting") {
+    // Waiting in line for another mesh member's model. Live only, never
+    // stored, and never content.
+    return {
+      type: "queued",
+      ahead: numberOr(raw["ahead"], 0),
+      node: stringOrUndefined(raw["node"]),
+      name: stringOrUndefined(raw["name"]),
+      rerouting: raw["rerouting"] === true,
+    };
   }
   if (type === "action") {
     const detail = (raw["detail"] ?? {}) as Record<string, unknown>;
@@ -161,6 +237,7 @@ export function toEvent(raw: Record<string, unknown>): ChatEvent | null {
       error: typeof raw["error"] === "string" && raw["error"] ? raw["error"] : undefined,
       contextOverflow: raw["context_overflow"] === true,
       responseUid: stringOrUndefined(raw["response"]),
+      ...answerDetails(raw),
     };
   }
 
@@ -174,8 +251,11 @@ function stringOrUndefined(value: unknown): string | undefined {
 
 export interface ChatStreamInit {
   events: AsyncGenerator<Record<string, unknown>>;
-  /** Stops the model server-side. Distinct from merely disconnecting. */
-  cancelFn: (responseUid: string | undefined) => Promise<void>;
+  /**
+   * Stops the model server-side. Distinct from merely disconnecting. Resolves
+   * true when the server found it running and stopped it.
+   */
+  cancelFn: (responseUid: string | undefined) => Promise<boolean>;
   conversationUid: string;
   responseUid: string | undefined;
 }
@@ -213,42 +293,52 @@ export class ChatStream implements AsyncIterable<ChatEvent> {
     let reasoning = "";
     let sawDone = false;
 
-    for await (const raw of this.init.events) {
-      const event = toEvent(raw);
-      if (!event) continue;
+    try {
+      for await (const raw of this.init.events) {
+        const event = toEvent(raw);
+        if (!event) continue;
 
-      if (event.type === "token") text += event.content;
-      if (event.type === "thinking") reasoning += event.content;
+        if (event.type === "token") text += event.content;
+        if (event.type === "thinking") reasoning += event.content;
 
-      if (event.type === "done") {
-        sawDone = true;
-        this.result = {
-          text,
-          reasoning,
-          conversationUid: this.conversationUid,
-          responseUid: event.responseUid ?? this.responseUid,
-          usage: event.usage,
-          sourceDocs: event.sourceDocs,
-          toolsUsed: event.toolsUsed,
-          finishReason: event.finishReason,
-          aborted: event.aborted,
-          error: event.error,
-        };
+        if (event.type === "done") {
+          sawDone = true;
+          this.result = {
+            text,
+            reasoning,
+            conversationUid: this.conversationUid,
+            responseUid: event.responseUid ?? this.responseUid,
+            usage: event.usage,
+            sourceDocs: event.sourceDocs,
+            toolsUsed: event.toolsUsed,
+            finishReason: event.finishReason,
+            aborted: event.aborted,
+            error: event.error,
+            model: event.model,
+            servedBy: event.servedBy,
+            meshFallback: event.meshFallback,
+            meshUnavailable: event.meshUnavailable,
+            generatedImages: event.generatedImages,
+            dataArtifacts: event.dataArtifacts,
+          };
+          yield event;
+          return;
+        }
         yield event;
-        return;
       }
-      yield event;
+    } catch (cause) {
+      // A dropped connection mid-answer surfaces from fetch as a bare
+      // TypeError ("terminated"). Raised as the SDK's own error, with what
+      // recovery looks like — unless the caller stopped on purpose.
+      if (this.cancelled || this.detached) return;
+      if (cause instanceof ExpertsError) throw cause;
+      if (cause instanceof Error && cause.name === "AbortError") {
+        throw new ExpertsAbortError("The request was cancelled", { cause });
+      }
+      throw incomplete(cause);
     }
 
-    if (!sawDone && !this.cancelled && !this.detached) {
-      // The answer very likely completed on the server regardless — generation
-      // is detached — so say what recovery actually looks like.
-      throw new ExpertsStreamError(
-        "The stream ended without a terminal event. The answer may still have " +
-          "completed on the server: re-read the conversation rather than resending.",
-        { code: "incomplete_stream" },
-      );
-    }
+    if (!sawDone && !this.cancelled && !this.detached) throw incomplete();
   }
 
   /** Consume the whole stream and return the finished answer. */
@@ -267,15 +357,20 @@ export class ChatStream implements AsyncIterable<ChatEvent> {
   }
 
   /**
-   * Stop the model.
+   * Stop the model. Resolves true when the server found it running and
+   * stopped it.
    *
    * Not the same as walking away from the stream: generation is detached
    * server-side, so an abandoned request keeps generating, keeps billing and
    * still persists its answer. This is the only thing that actually stops it.
+   *
+   * False means the server had nothing to stop: the answer had already
+   * finished, or — behind a load balancer with several conversation workers —
+   * it is running on another one.
    */
-  async cancel(): Promise<void> {
+  async cancel(): Promise<boolean> {
     this.cancelled = true;
-    await this.init.cancelFn(this.responseUid);
+    return this.init.cancelFn(this.responseUid);
   }
 
   /**
@@ -287,4 +382,15 @@ export class ChatStream implements AsyncIterable<ChatEvent> {
   detach(): void {
     this.detached = true;
   }
+}
+
+function incomplete(cause?: unknown): ExpertsStreamError {
+  // The answer very likely completed on the server regardless — generation is
+  // detached — so say what recovery actually looks like.
+  const how = cause instanceof Error ? ` (${cause.message})` : "";
+  return new ExpertsStreamError(
+    `The stream ended without a terminal event${how}. The answer may still have ` +
+      "completed on the server: re-read the conversation rather than resending.",
+    cause === undefined ? { code: "incomplete_stream" } : { code: "incomplete_stream", cause },
+  );
 }

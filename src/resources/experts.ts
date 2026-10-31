@@ -20,6 +20,7 @@ interface RawExpert {
   output_language?: string | null;
   min_role_id?: number;
   private?: boolean;
+  scope_uids?: string[] | null;
 }
 
 // Expert rows come back snake_case, unlike conversation rows. Normalised here.
@@ -38,6 +39,7 @@ function toExpert(raw: RawExpert): Expert {
     outputLanguage: raw.output_language ?? null,
     minRoleId: raw.min_role_id ?? 2,
     private: raw.private ?? false,
+    scopeUids: raw.scope_uids ?? [],
   };
 }
 
@@ -61,12 +63,16 @@ export class Experts {
   /**
    * Experts a browser session may use.
    *
-   * A session token carries the guest role, and an expert above that floor
-   * resolves to nothing server-side — the chat then answers on the site
-   * default model with no persona and no knowledge, silently. Use this to
-   * build a picker that only offers experts that will actually work.
+   * A session token carries the guest role, so `sessions.create()` refuses
+   * an expert above that floor, a private one, or one limited to org profiles
+   * (a visitor is in none of them). Before build pack 1.1 such an expert
+   * silently answered on the site default model with no persona and no
+   * knowledge instead. Use this to build a picker that only offers experts
+   * that will actually work.
    */
   async listGuestVisible(): Promise<Expert[]> {
-    return (await this.list()).filter((e) => !e.private && e.minRoleId <= 1);
+    return (await this.list()).filter(
+      (e) => !e.private && e.minRoleId <= 1 && e.scopeUids.length === 0,
+    );
   }
 }
