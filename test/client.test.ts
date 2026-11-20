@@ -366,3 +366,73 @@ describe("normalisation", () => {
     expect((await sdk.experts.listGuestVisible()).map((e) => e.uid)).toEqual(["guest-ok", "unscoped"]);
   });
 });
+
+describe("decide (Experts 1.2)", () => {
+  const DECISION = {
+    model: "tev1:0.8b",
+    backend: "local",
+    answers: {
+      kind: {
+        type: "choice",
+        choice: "billing",
+        confidence: 0.98,
+        probabilities: { billing: 0.94, support: 0.04, sales: 0.02 },
+      },
+      risky: { type: "noul", noul: 0.25 },
+      urgency: {
+        type: "score",
+        score: 0.33,
+        legend: { "0": "waiting on money", "1": "a deadline" },
+        probabilities: { "0": 0.67, "1": 0.33 },
+        confidence: 0.08,
+      },
+    },
+    usage: { input_tokens: 159, output_tokens: 0 },
+  };
+  const KIND = {
+    kind: {
+      type: "choice" as const,
+      instructions: "What kind of email?",
+      criteria: { billing: "money", support: "help", sales: "buying" },
+    },
+  };
+
+  it("posts the case and reads each answer by name", async () => {
+    const { sdk, calls } = client([{ json: DECISION }]);
+    const decision = await sdk.decide("refund INV-2231", KIND, { feature: "mail_sort" });
+    expect(calls.map((c) => `${c.method} ${new URL(c.url).pathname}`)).toEqual(["POST /api/v1/llm/decide"]);
+    expect(calls[0]?.body).toEqual({ state: "refund INV-2231", questions: KIND, feature: "mail_sort" });
+    expect(calls[0]?.headers["authorization"]).toBe("Bearer sk-test");
+    const kind = decision.answers["kind"];
+    expect([kind?.type, kind?.choice]).toEqual(["choice", "billing"]);
+    // The pick's own probability, apart from the model's confidence
+    expect([kind?.probability, kind?.confidence]).toEqual([0.94, 0.98]);
+    expect(decision.answers["risky"]).toMatchObject({ noul: 0.25, probability: null });
+    expect(decision.answers["urgency"]).toMatchObject({ score: 0.33, legend: { "1": "a deadline" } });
+    expect(decision).toMatchObject({ model: "tev1:0.8b", backend: "local", usage: { inputTokens: 159, outputTokens: 0 } });
+  });
+
+  it("sends a model, a backend and a reference only when named", async () => {
+    const { sdk, calls } = client([{ json: DECISION }]);
+    await sdk.decide({ subject: "x" }, KIND, { model: "tev1:4b", backend: "b1", referenceId: "r" });
+    expect(calls[0]?.body).toEqual({
+      state: { subject: "x" },
+      questions: KIND,
+      model: "tev1:4b",
+      backend: "b1",
+      reference_id: "r",
+    });
+  });
+
+  it("is refused in words, and asks again while the model is still coming", async () => {
+    const refused = client([{ status: 422, json: { detail: "Question kind is a choice" } }]);
+    await expect(refused.sdk.decide("x", KIND)).rejects.toThrow("Question kind is a choice");
+    const { impl, calls } = stubFetch([
+      { status: 503, json: { detail: "tev1:0.8b is downloading" } },
+      { json: DECISION },
+    ]);
+    const sdk = new ExpertsClient({ apiKey: "sk-test", baseUrl: "https://install.example", fetch: impl, maxRetries: 2 });
+    expect((await sdk.decide("x", KIND)).answers["kind"]?.choice).toBe("billing");
+    expect(calls).toHaveLength(2);
+  });
+});

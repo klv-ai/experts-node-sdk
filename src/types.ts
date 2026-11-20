@@ -330,3 +330,37 @@ export interface SendOptions {
   context?: string[];
   signal?: AbortSignal;
 }
+
+/** One question's answer from a decision model (Experts 1.2). */
+export interface DecisionAnswer {
+  /** "choice", "noul" (a yes/no as one probability) or "score". */
+  type: string;
+  /** A choice question's pick. */
+  choice: string | null;
+  /**
+   * The pick's own probability: what a threshold should be set on. Null for
+   * a question with no pick.
+   */
+  probability: number | null;
+  /** Each option's probability (a score question's by criterion index). */
+  probabilities: Record<string, number>;
+  /**
+   * The model's own confidence: one minus the answer's normalised entropy.
+   * It says how spread the probabilities are, not how likely the pick is.
+   */
+  confidence: number | null;
+  /** A "noul" question's probability of yes. */
+  noul: number | null;
+  /** A "score" question's score, and its criteria by index. */
+  score: number | null;
+  legend: Record<string, string>;
+}
+
+/** A decision model's answers, by question name. */
+export interface Decision {
+  model: string;
+  answers: Record<string, DecisionAnswer>;
+  /** The install's backend that answered, when it says. */
+  backend: string | null;
+  usage: { inputTokens: number; outputTokens: number };
+}
