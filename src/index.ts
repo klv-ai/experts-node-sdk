@@ -19,6 +19,7 @@ export type {
 export { Experts } from "./resources/experts.js";
 export { Knowledge } from "./resources/knowledge.js";
 export { Sessions, type CreateSessionOptions } from "./resources/sessions.js";
+export { type DecideOptions, type DecisionQuestion } from "./resources/decisions.js";
 
 export {
   ExpertsError,

@@ -9,9 +9,11 @@
 
 import { Transport, type TransportOptions } from "./http.js";
 import { Conversations } from "./resources/conversations.js";
+import { decide, type DecideOptions, type DecisionQuestion } from "./resources/decisions.js";
 import { Experts } from "./resources/experts.js";
 import { Knowledge } from "./resources/knowledge.js";
 import { Sessions } from "./resources/sessions.js";
+import type { Decision } from "./types.js";
 
 export interface ExpertsClientOptions extends Omit<TransportOptions, "token"> {
   /** Your `sk-` key. Server-side only. */
@@ -46,5 +48,19 @@ export class ExpertsClient {
     this.experts = new Experts(this.transport);
     this.knowledge = new Knowledge(this.transport);
     this.sessions = new Sessions(this.transport);
+  }
+
+  /**
+   * Ask the install's decision model named questions about a case (Experts
+   * 1.2). `questions` is `{name: {type, instructions, criteria}}`; answers
+   * come back by name: `decision.answers.kind.choice` and `.probability` for a
+   * choice question. See `resources/decisions`.
+   */
+  decide(
+    state: string | Record<string, unknown> | unknown[],
+    questions: Record<string, DecisionQuestion>,
+    options: DecideOptions = {},
+  ): Promise<Decision> {
+    return decide(this.transport, state, questions, options);
   }
 }
